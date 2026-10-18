@@ -64,8 +64,16 @@ vi.mock("../src/services/anchor", () => ({
   mapAnchorStatus: vi.fn((s: string) => s),
 }));
 
+import {
+  Account,
+  BASE_FEE,
+  Keypair,
+  Operation,
+  TransactionBuilder,
+} from "@stellar/stellar-sdk";
 import { buildApp } from "../src/app";
 import { signToken } from "../src/plugins/auth";
+import { config } from "../src/config";
 
 const prisma = h.prisma;
 
@@ -81,6 +89,50 @@ const fakeUser = (over: Partial<any> = {}) => ({
 function authHeader(user = fakeUser()) {
   const token = signToken({ id: user.id, stellarPublicKey: user.stellarPublicKey });
   return { authorization: `Bearer ${token}` };
+}
+
+/**
+ * A signed transaction envelope of the kind `POST /withdraw/:id/confirm`
+ * accepts: an account's own transaction, signed by its key.
+ *
+ * Built rather than written out as a literal, because the route validates the
+ * payload as canonical base64 XDR that the SDK can decode (#663) — the
+ * `"AAAA..."` placeholder this suite used to send never was one, and no longer
+ * passes.
+ */
+function signedXdr(): string {
+  const signer = Keypair.random();
+  const transaction = new TransactionBuilder(new Account(signer.publicKey(), "0"), {
+    fee: BASE_FEE,
+    networkPassphrase: config.networkPassphrase,
+  })
+    .addOperation(Operation.manageData({ name: "withdraw-test", value: "signed" }))
+    .setTimeout(60)
+    .build();
+  transaction.sign(signer);
+  return transaction.toXDR();
+}
+
+/** The fields a 400 VALIDATION_ERROR named, from the shared error envelope. */
+function failedFields(body: any): string[] {
+  return (body.error?.details ?? []).map((detail: any) => detail.field);
+}
+
+/**
+ * A caller with its own identity.
+ *
+ * The `anchorInit` and `settlementConfirm` budgets are keyed by the caller's
+ * Stellar public key (src/services/rate-limit-keys.ts), so a suite that fires a
+ * dozen malformed requests as one user would have the eleventh answered 429
+ * where it means to assert a 400. Each rejection case authenticates as its own
+ * user — the same escape the SEP-24 initiation suite uses.
+ */
+let anonSeq = 0;
+function freshAuthHeader() {
+  anonSeq += 1;
+  return authHeader(
+    fakeUser({ id: `anon_${anonSeq}`, stellarPublicKey: Keypair.random().publicKey() })
+  );
 }
 
 let app: Awaited<ReturnType<typeof buildApp>>;
@@ -281,7 +333,7 @@ describe("POST /withdraw/:id/confirm", () => {
       method: "POST",
       url: "/withdraw/wth_1/confirm",
       headers: authHeader(user),
-      payload: { signedXdr: "AAAA..." },
+      payload: { signedXdr: signedXdr() },
     });
 
     expect(res.statusCode).toBe(200);
@@ -321,7 +373,7 @@ describe("POST /withdraw/:id/confirm", () => {
       method: "POST",
       url: "/withdraw/wth_1/confirm",
       headers: authHeader(user),
-      payload: { signedXdr: "AAAA..." },
+      payload: { signedXdr: signedXdr() },
     });
 
     expect(res.statusCode).toBe(502);
@@ -342,7 +394,7 @@ describe("POST /withdraw/:id/confirm", () => {
       method: "POST",
       url: "/withdraw/wth_1/confirm",
       headers: authHeader(user),
-      payload: { signedXdr: "AAAA..." },
+      payload: { signedXdr: signedXdr() },
     });
 
     expect(res.statusCode).toBe(200);
@@ -358,7 +410,7 @@ describe("POST /withdraw/:id/confirm", () => {
       method: "POST",
       url: "/withdraw/missing/confirm",
       headers: authHeader(),
-      payload: { signedXdr: "AAAA..." },
+      payload: { signedXdr: signedXdr() },
     });
 
     expect(res.statusCode).toBe(404);
@@ -373,7 +425,7 @@ describe("POST /withdraw/:id/confirm", () => {
       method: "POST",
       url: "/withdraw/wth_1/confirm",
       headers: authHeader(fakeUser({ id: "user_1" })),
-      payload: { signedXdr: "AAAA..." },
+      payload: { signedXdr: signedXdr() },
     });
 
     expect(res.statusCode).toBe(404);
@@ -444,5 +496,154 @@ describe("GET /withdraw/:id", () => {
     });
     expect(res.statusCode).toBe(403);
     expect(res.json().error.code).toBe("FORBIDDEN");
+  });
+});
+
+describe("POST /withdraw — Zod request schema rejections (#663)", () => {
+  // Each payload is answered by the shared SEP-24 shape schema, so the check
+  // that matters here is *where* the request stops: a malformed withdrawal
+  // must never reach the balance lookup, the anchor's TOML, the database, or
+  // the audit log.
+  const cases: Array<[string, unknown, string[]]> = [
+    ["an empty body", {}, ["amount", "assetCode"]],
+    ["a missing amount", { assetCode: "XLM" }, ["amount"]],
+    ["a missing asset code", { amount: "10" }, ["assetCode"]],
+    ["a non-numeric amount", { amount: "ten", assetCode: "XLM" }, ["amount"]],
+    [
+      "an amount with eight decimal places",
+      { amount: "10.00000000", assetCode: "XLM" },
+      ["amount"],
+    ],
+    ["a negative amount", { amount: "-5", assetCode: "XLM" }, ["amount"]],
+    ["an amount sent as a JSON number", { amount: 10, assetCode: "XLM" }, ["amount"]],
+    ["an asset code with punctuation", { amount: "1", assetCode: "US_DC" }, ["assetCode"]],
+    [
+      "an asset code longer than twelve characters",
+      { amount: "1", assetCode: "ABCDEFGHIJKLMNOP" },
+      ["assetCode"],
+    ],
+    [
+      "a memo without the Mergepay prefix",
+      { amount: "1", assetCode: "XLM", memo: "hello" },
+      ["memo"],
+    ],
+    [
+      "an unknown field, rather than silently dropping it",
+      { amount: "1", assetCode: "XLM", asset_code: "XLM" },
+      ["asset_code"],
+    ],
+  ];
+
+  it.each(cases)("rejects %s with a 400 that names the field", async (label, payload, fields) => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/withdraw",
+      headers: freshAuthHeader(),
+      payload,
+    });
+
+    expect(res.statusCode, label).toBe(400);
+    const body = res.json();
+    expect(body.error.code, label).toBe("VALIDATION_ERROR");
+    expect(failedFields(body), label).toEqual(expect.arrayContaining(fields));
+
+    const { stellar } = await import("../src/services/stellar");
+    const { anchorService } = await import("../src/services/anchor");
+    expect(stellar.loadAccount, `${label}: reached Stellar`).not.toHaveBeenCalled();
+    expect(anchorService.getToml, `${label}: reached the anchor`).not.toHaveBeenCalled();
+    expect(prisma.withdrawal.create, `${label}: wrote a withdrawal`).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create, `${label}: wrote an audit row`).not.toHaveBeenCalled();
+  });
+
+  it("keeps the handler's own error codes for values that are well-shaped", async () => {
+    // "0" passes the shape rule and is rejected for being non-positive; the
+    // schema must not swallow INVALID_AMOUNT behind a VALIDATION_ERROR.
+    const res = await app.inject({
+      method: "POST",
+      url: "/withdraw",
+      headers: freshAuthHeader(),
+      payload: { amount: "0", assetCode: "XLM" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("INVALID_AMOUNT");
+  });
+});
+
+describe("POST /withdraw/:id/confirm — the signed XDR is validated up front (#663)", () => {
+  const invalid: Array<[string, unknown]> = [
+    ["a missing signedXdr", {}],
+    ["an empty signedXdr", { signedXdr: "" }],
+    ["a payload that is not base64", { signedXdr: "not-xdr!!" }],
+    ["a placeholder that never was an envelope", { signedXdr: "AAAA..." }],
+    [
+      "canonical base64 that is not a Stellar transaction",
+      { signedXdr: Buffer.from("mergepay").toString("base64") },
+    ],
+  ];
+
+  it.each(invalid)("rejects %s with a 400 before the anchor is contacted", async (label, payload) => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/withdraw/wth_1/confirm",
+      headers: freshAuthHeader(),
+      payload,
+    });
+
+    expect(res.statusCode, label).toBe(400);
+    const body = res.json();
+    expect(body.error.code, label).toBe("VALIDATION_ERROR");
+    expect(failedFields(body), label).toContain("signedXdr");
+
+    const { anchorService } = await import("../src/services/anchor");
+    expect(anchorService.getToken, `${label}: reached the anchor`).not.toHaveBeenCalled();
+    expect(
+      anchorService.startInteractive,
+      `${label}: started an interactive flow`
+    ).not.toHaveBeenCalled();
+    expect(prisma.withdrawal.findUnique, `${label}: read the withdrawal`).not.toHaveBeenCalled();
+  });
+
+  it("accepts a signed envelope the SDK can decode", async () => {
+    const { anchorService } = await import("../src/services/anchor");
+    vi.mocked(anchorService.getToken).mockResolvedValueOnce("anchor-jwt");
+    vi.mocked(anchorService.startInteractive).mockResolvedValueOnce({
+      url: "https://testanchor.stellar.org/sep24/interactive/abc",
+      id: "ANCH-TX-9",
+    });
+    const pending = {
+      id: "wth_1",
+      userId: "user_1",
+      amount: "5",
+      assetCode: "XLM",
+      assetIssuer: null,
+      memo: null,
+      anchorTxId: null,
+      interactiveUrl: "https://testanchor.stellar.org/sep24/withdraw",
+      status: "pending",
+      failureReason: null,
+      createdAt: new Date("2026-04-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-04-01T00:00:00.000Z"),
+    };
+    // Three reads: the route's ownership lookup, the transition's guarded
+    // re-read, and the row the transition returns.
+    prisma.withdrawal.findUnique
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValueOnce({
+        ...pending,
+        status: "processing",
+        anchorTxId: "ANCH-TX-9",
+      });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/withdraw/wth_1/confirm",
+      headers: authHeader(),
+      payload: { signedXdr: signedXdr() },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().transaction_id).toBe("ANCH-TX-9");
+    expect(anchorService.getToken).toHaveBeenCalledOnce();
   });
 });
