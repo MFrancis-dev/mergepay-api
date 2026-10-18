@@ -118,28 +118,17 @@ function failedFields(body: any): string[] {
   return (body.error?.details ?? []).map((detail: any) => detail.field);
 }
 
-/**
- * A caller with its own identity.
- *
- * The `anchorInit` and `settlementConfirm` budgets are keyed by the caller's
- * Stellar public key (src/services/rate-limit-keys.ts), so a suite that fires a
- * dozen malformed requests as one user would have the eleventh answered 429
- * where it means to assert a 400. Each rejection case authenticates as its own
- * user — the same escape the SEP-24 initiation suite uses.
- */
-let anonSeq = 0;
-function freshAuthHeader() {
-  anonSeq += 1;
-  return authHeader(
-    fakeUser({ id: `anon_${anonSeq}`, stellarPublicKey: Keypair.random().publicKey() })
-  );
-}
-
 let app: Awaited<ReturnType<typeof buildApp>>;
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  if (!app) app = await buildApp();
+  // This suite is about the withdrawal contract, not throttling, so it boots
+  // without the limiter as CONTRIBUTING directs (#658). The `anchorInit` and
+  // `settlementConfirm` tiers key on the caller's identity, so one app reused
+  // across this file would spend them and answer a later, unrelated assertion
+  // with a 429. The 429 contract itself stays under test in
+  // tests/rate-limit-sensitive-routes.test.ts, which keeps the default.
+  if (!app) app = await buildApp({ rateLimit: "off" });
   // Default: anchor TOML works.
   const { stellar } = await import("../src/services/stellar");
   const { anchorService } = await import("../src/services/anchor");
@@ -538,7 +527,7 @@ describe("POST /withdraw — Zod request schema rejections (#663)", () => {
     const res = await app.inject({
       method: "POST",
       url: "/withdraw",
-      headers: freshAuthHeader(),
+      headers: authHeader(),
       payload,
     });
 
@@ -561,7 +550,7 @@ describe("POST /withdraw — Zod request schema rejections (#663)", () => {
     const res = await app.inject({
       method: "POST",
       url: "/withdraw",
-      headers: freshAuthHeader(),
+      headers: authHeader(),
       payload: { amount: "0", assetCode: "XLM" },
     });
     expect(res.statusCode).toBe(400);
@@ -585,7 +574,7 @@ describe("POST /withdraw/:id/confirm — the signed XDR is validated up front (#
     const res = await app.inject({
       method: "POST",
       url: "/withdraw/wth_1/confirm",
-      headers: freshAuthHeader(),
+      headers: authHeader(),
       payload,
     });
 
