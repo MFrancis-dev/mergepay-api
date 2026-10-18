@@ -176,6 +176,9 @@ describe("sensitive routes carry the tighter per-route budget", () => {
     ["POST", "/groups/:groupId/treasury/proposals", "treasuryPropose"],
     ["POST", "/api/treasury/proposals/:id/signatures", "treasurySubmit"],
     ["POST", "/groups/:groupId/treasury/proposals/:proposalId/sign", "treasurySubmit"],
+    // Issue #657's collection-style aliases of the same two operations.
+    ["POST", "/treasury/propose", "treasuryPropose"],
+    ["POST", "/treasury/:id/sign", "treasurySubmit"],
     // Anchor / SEP-24. Initiation fans out upstream, so it is the tightest.
     ["POST", "/anchors/deposit", "anchorInit"],
     ["POST", "/anchors/withdraw", "anchorInit"],

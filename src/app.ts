@@ -20,6 +20,7 @@ import settlementRoutes from "./routes/settlements";
 import treasuryRoutes from "./routes/treasury";
 import treasuryProposalRoutes from "./routes/treasury-proposals";
 import treasurySignatureRoutes from "./routes/treasury-signatures";
+import treasuryMultisigRoutes from "./routes/treasury-multisig";
 import anchorRoutes from "./routes/anchors";
 import withdrawalRoutes from "./routes/withdraw";
 import historyRoutes from "./routes/history";
@@ -269,6 +270,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     "/treasury-transactions/:id/confirm",
     "/api/treasury/proposals",
     "/api/treasury/proposals/:id/signatures",
+    "/treasury/propose",
+    "/treasury/:id/sign",
     "/anchors/deposit",
     "/anchors/withdraw",
     "/api/sep24/deposit",
@@ -335,6 +338,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(treasuryRoutes);
   await app.register(treasuryProposalRoutes);
   await app.register(treasurySignatureRoutes);
+  await app.register(treasuryMultisigRoutes);
   await app.register(anchorRoutes);
   await app.register(withdrawalRoutes);
   await app.register(historyRoutes);
